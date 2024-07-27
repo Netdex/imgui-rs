@@ -81,7 +81,8 @@ fn main() {
         .insert(ConfigFlags::VIEWPORTS_ENABLE);
     imgui.set_ini_filename(None);
 
-    let mut renderer = Renderer::new(&mut imgui, &window, &glow).expect("Failed to init Renderer");
+    let mut renderer =
+        Renderer::new(&mut imgui, &window, &glow, None).expect("Failed to init Renderer");
 
     let mut last_frame = Instant::now();
 

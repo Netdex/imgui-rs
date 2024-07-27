@@ -22,12 +22,14 @@ use imgui::{BackendFlags, ConfigFlags, Id, Io, Key, MouseButton, ViewportFlags};
 use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 use thiserror::Error;
 use winit::{
-    dpi::{PhysicalPosition, PhysicalSize},
+    dpi::{LogicalPosition, LogicalSize},
     event::{ElementState, TouchPhase},
     event_loop::EventLoopWindowTarget,
     keyboard::{Key as WinitKey, KeyLocation, NamedKey},
-    platform::modifier_supplement::KeyEventExtModifierSupplement,
-    window::{CursorIcon, Window, WindowBuilder},
+    platform::{
+        modifier_supplement::KeyEventExtModifierSupplement, windows::WindowBuilderExtWindows,
+    },
+    window::{CursorIcon, Window, WindowBuilder, WindowLevel},
 };
 
 const VERTEX_SHADER: &str = include_str!("vertex_shader.glsl");
@@ -68,10 +70,12 @@ enum ViewportEvent {
     SetTitle(Id, String),
 }
 
-#[derive(Debug)]
+type WindowBuilderCallback = dyn Fn(&imgui::Viewport) -> WindowBuilder;
+
 pub struct Renderer {
     gl_objects: GlObjects,
     glutin_config: Option<glutin::config::Config>,
+    window_builder: Option<Box<WindowBuilderCallback>>,
     /// The tuple members have to stay in exactly this order
     /// to ensure that surface, context and window are dropped in this order
     extra_windows: HashMap<
@@ -86,14 +90,14 @@ pub struct Renderer {
     event_queue: Rc<RefCell<VecDeque<ViewportEvent>>>,
     font_width: u32,
     font_height: u32,
-    font_pixels: Vec<u8>,
+    font_data: Vec<u8>,
     last_cursor: CursorIcon,
 }
 
 #[derive(Debug)]
 struct GlObjects {
     program: glow::Program,
-    font_texture: glow::Texture,
+    font_atlas: glow::Texture,
     vao: glow::VertexArray,
     vbo: glow::Buffer,
     ibo: glow::Buffer,
@@ -103,7 +107,7 @@ impl GlObjects {
     pub fn new(
         font_width: u32,
         font_height: u32,
-        font_pixels: &[u8],
+        font_data: &[u8],
         glow: &glow::Context,
     ) -> Result<Self, RendererError> {
         let program = unsafe {
@@ -144,7 +148,7 @@ impl GlObjects {
             program
         };
 
-        let font_texture = unsafe {
+        let font_atlas = unsafe {
             let tex = glow
                 .create_texture()
                 .map_err(RendererError::GlTextureCreationFailed)?;
@@ -178,7 +182,7 @@ impl GlObjects {
                 0,
                 glow::RGBA,
                 glow::UNSIGNED_BYTE,
-                Some(font_pixels),
+                Some(font_data),
             );
 
             tex
@@ -214,7 +218,7 @@ impl GlObjects {
 
         Ok(Self {
             program,
-            font_texture,
+            font_atlas,
             vao,
             vbo,
             ibo,
@@ -344,7 +348,9 @@ impl Renderer {
         imgui: &mut imgui::Context,
         main_window: &Window,
         gl_context: &glow::Context,
+        window_builder: Option<Box<WindowBuilderCallback>>,
     ) -> Result<Self, RendererError> {
+        let dpi_scale = main_window.scale_factor();
         let io = imgui.io_mut();
 
         // there is no good way to handle viewports on wayland,
@@ -366,8 +372,9 @@ impl Renderer {
             .insert(BackendFlags::RENDERER_HAS_VTX_OFFSET);
 
         let window_size = main_window.inner_size().cast::<f32>();
-        io.display_size = [window_size.width, window_size.height];
-        io.display_framebuffer_scale = [1.0, 1.0];
+        let logical_size = window_size.to_logical::<f32>(dpi_scale);
+        io.display_size = logical_size.into();
+        io.display_framebuffer_scale = [dpi_scale as f32, dpi_scale as f32];
 
         let viewport = imgui.main_viewport_mut();
 
@@ -375,15 +382,16 @@ impl Renderer {
             .inner_position()
             .unwrap_or_default()
             .cast::<f32>();
+        let logical_pos = main_pos.to_logical::<f32>(dpi_scale);
 
-        viewport.pos = [main_pos.x, main_pos.y];
-        viewport.work_pos = viewport.pos;
-        viewport.size = [window_size.width, window_size.height];
-        viewport.work_size = viewport.size;
-        viewport.dpi_scale = 1.0;
+        viewport.pos = logical_pos.into();
+        viewport.work_pos = logical_pos.into();
+        viewport.size = logical_size.into();
+        viewport.work_size = logical_size.into();
+        viewport.dpi_scale = dpi_scale as f32;
         viewport.platform_user_data = Box::into_raw(Box::new(ViewportData {
-            pos: [main_pos.x, main_pos.y],
-            size: [window_size.width, window_size.height],
+            pos: logical_pos.into(),
+            size: logical_size.into(),
             focus: true,
             minimized: false,
         }))
@@ -396,7 +404,7 @@ impl Renderer {
                 main_size: [monitor.size().width as f32, monitor.size().height as f32],
                 work_pos: [monitor.position().x as f32, monitor.position().y as f32],
                 work_size: [monitor.size().width as f32, monitor.size().height as f32],
-                dpi_scale: 1.0,
+                dpi_scale: monitor.scale_factor() as f32,
             });
         }
         imgui
@@ -420,18 +428,23 @@ impl Renderer {
         });
         imgui.set_renderer_backend(RendererBackend {});
 
-        let font_tex = imgui.fonts().build_rgba32_texture();
-        let gl_objects =
-            GlObjects::new(font_tex.width, font_tex.height, font_tex.data, gl_context)?;
+        let font_atlas = imgui.fonts().build_rgba32_texture();
+        let gl_objects = GlObjects::new(
+            font_atlas.width,
+            font_atlas.height,
+            font_atlas.data,
+            gl_context,
+        )?;
 
         Ok(Self {
             gl_objects,
             glutin_config: None,
+            window_builder,
             extra_windows: HashMap::new(),
             event_queue,
-            font_width: font_tex.width,
-            font_height: font_tex.height,
-            font_pixels: font_tex.data.to_vec(),
+            font_width: font_atlas.width,
+            font_height: font_atlas.height,
+            font_data: font_atlas.data.to_vec(),
             last_cursor: CursorIcon::Default,
         })
     }
@@ -469,22 +482,23 @@ impl Renderer {
 
             match *event {
                 winit::event::WindowEvent::Resized(new_size) => {
+                    let logical_size = new_size.to_logical::<f32>(viewport.dpi_scale.into());
                     unsafe {
                         (*(viewport.platform_user_data.cast::<ViewportData>())).size =
-                            [new_size.width as f32, new_size.height as f32];
+                            logical_size.into();
                     }
 
                     viewport.platform_request_resize = true;
 
                     if window_id == main_window.id() {
-                        imgui.io_mut().display_size =
-                            [new_size.width as f32, new_size.height as f32];
+                        imgui.io_mut().display_size = logical_size.into();
                     }
                 }
                 winit::event::WindowEvent::Moved(_) => unsafe {
                     let new_pos = window.inner_position().unwrap().cast::<f32>();
+                    let logical_pos = new_pos.to_logical::<f32>(viewport.dpi_scale.into());
                     (*(viewport.platform_user_data.cast::<ViewportData>())).pos =
-                        [new_pos.x, new_pos.y];
+                        logical_pos.into();
 
                     viewport.platform_request_move = true;
                 },
@@ -533,15 +547,18 @@ impl Renderer {
                         .add_key_event(Key::ModSuper, state.super_key());
                 }
                 winit::event::WindowEvent::CursorMoved { position, .. } => {
+                    let logical_pos = position.to_logical::<f32>(viewport.dpi_scale.into());
+                    let window_pos = window.inner_position().unwrap_or_default().cast::<f32>();
+                    let window_logical_pos =
+                        window_pos.to_logical::<f32>(viewport.dpi_scale.into());
                     if imgui
                         .io()
                         .config_flags
                         .contains(ConfigFlags::VIEWPORTS_ENABLE)
                     {
-                        let window_pos = window.inner_position().unwrap_or_default().cast::<f32>();
                         imgui.io_mut().add_mouse_pos_event([
-                            position.x as f32 + window_pos.x,
-                            position.y as f32 + window_pos.y,
+                            logical_pos.x + window_logical_pos.x,
+                            logical_pos.y + window_logical_pos.y,
                         ]);
                     } else {
                         imgui
@@ -582,6 +599,14 @@ impl Renderer {
                         imgui.io_mut().add_mouse_button_event(button, state);
                     }
                 }
+                winit::event::WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                    viewport.dpi_scale = scale_factor as f32;
+                    viewport.platform_request_resize = true;
+                    if window_id == main_window.id() {
+                        imgui.io_mut().display_framebuffer_scale =
+                            [scale_factor as f32, scale_factor as f32];
+                    }
+                }
                 _ => {}
             }
         }
@@ -613,13 +638,23 @@ impl Renderer {
                     self.extra_windows.remove(&id);
                 }
                 ViewportEvent::SetPos(id, pos) => {
-                    if let Some((_, _, _, wnd)) = self.extra_windows.get(&id) {
-                        wnd.set_outer_position(PhysicalPosition::new(pos[0], pos[1]));
+                    if let Some(viewport) = imgui.viewport_by_id_mut(id) {
+                        if let Some((_, _, _, wnd)) = self.extra_windows.get(&id) {
+                            let logical_pos = LogicalPosition::new(pos[0], pos[1]);
+                            let physical_pos =
+                                logical_pos.to_physical::<f32>(viewport.dpi_scale.into());
+                            wnd.set_outer_position(physical_pos);
+                        }
                     }
                 }
                 ViewportEvent::SetSize(id, size) => {
-                    if let Some((_, _, _, wnd)) = self.extra_windows.get(&id) {
-                        _ = wnd.request_inner_size(PhysicalSize::new(size[0], size[1]));
+                    if let Some(viewport) = imgui.viewport_by_id_mut(id) {
+                        if let Some((_, _, _, wnd)) = self.extra_windows.get(&id) {
+                            let logical_size = LogicalSize::new(size[0], size[1]);
+                            let physical_size =
+                                logical_size.to_physical::<f32>(viewport.dpi_scale.into());
+                            _ = wnd.request_inner_size(physical_size);
+                        }
                     }
                 }
                 ViewportEvent::SetVisible(id) => {
@@ -687,12 +722,26 @@ impl Renderer {
         ),
         RendererError,
     > {
-        let window_builder = WindowBuilder::new()
-            .with_position(PhysicalPosition::new(viewport.pos[0], viewport.pos[1]))
-            .with_inner_size(PhysicalSize::new(viewport.size[0], viewport.size[1]))
-            .with_visible(false)
-            .with_resizable(true)
-            .with_decorations(!viewport.flags.contains(ViewportFlags::NO_DECORATION));
+        let logical_pos = LogicalPosition::new(viewport.pos[0], viewport.pos[1]);
+        let logical_size = LogicalSize::new(viewport.size[0], viewport.size[1]);
+
+        let window_builder = if let Some(window_builder) = &self.window_builder {
+            window_builder(viewport)
+        } else {
+            WindowBuilder::new()
+                .with_resizable(true)
+                .with_transparent(true)
+                .with_skip_taskbar(viewport.flags.contains(ViewportFlags::NO_TASK_BAR_ICON))
+                .with_decorations(!viewport.flags.contains(ViewportFlags::NO_DECORATION))
+                .with_window_level(if viewport.flags.contains(ViewportFlags::TOP_MOST) {
+                    WindowLevel::AlwaysOnTop
+                } else {
+                    WindowLevel::Normal
+                })
+        }
+        .with_visible(false)
+        .with_position(logical_pos.to_physical::<f32>(viewport.dpi_scale.into()))
+        .with_inner_size(logical_size.to_physical::<f32>(viewport.dpi_scale.into()));
 
         let window = if let Some(glutin_config) = &self.glutin_config {
             glutin_winit::finalize_window(window_target, window_builder, glutin_config)
@@ -712,6 +761,30 @@ impl Renderer {
             window.unwrap()
         };
 
+        if viewport.flags.contains(ViewportFlags::NO_DECORATION) {
+            match window.raw_window_handle() {
+                RawWindowHandle::Win32(handle) => {
+                    // disable window animations for undecorated windows
+                    let hwnd = handle.hwnd;
+                    #[cfg(windows)]
+                    unsafe {
+                        use windows::Win32::Foundation::*;
+                        use windows::Win32::Graphics::Dwm::*;
+
+                        let value: BOOL = TRUE;
+                        DwmSetWindowAttribute(
+                            HWND(hwnd as _),
+                            DWMWA_TRANSITIONS_FORCEDISABLED,
+                            &value as *const BOOL as *const _,
+                            std::mem::size_of::<BOOL>() as _,
+                        )
+                        .unwrap();
+                    }
+                }
+                _ => {}
+            };
+        }
+
         let glutin_config = self.glutin_config.as_ref().unwrap();
 
         let context_attribs =
@@ -722,11 +795,12 @@ impl Renderer {
                 .create_context(glutin_config, &context_attribs)
                 .map_err(|_| RendererError::WindowContextCreationFailed)?
         };
-
+        let viewport_w = viewport.size[0] * viewport.dpi_scale;
+        let viewport_h = viewport.size[1] * viewport.dpi_scale;
         let surface_attribs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
             window.raw_window_handle(),
-            NonZeroU32::new(viewport.size[0] as u32).unwrap(),
-            NonZeroU32::new(viewport.size[1] as u32).unwrap(),
+            NonZeroU32::new(viewport_w as u32).unwrap(),
+            NonZeroU32::new(viewport_h as u32).unwrap(),
         );
         let surface = unsafe {
             glutin_config
@@ -739,8 +813,14 @@ impl Renderer {
             .make_current(&surface)
             .map_err(|_| RendererError::MakeCurrentFailed)?;
 
-        let gl_objects =
-            GlObjects::new(self.font_width, self.font_height, &self.font_pixels, glow)?;
+        surface
+            .set_swap_interval(
+                &context,
+                glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap()),
+            )
+            .unwrap();
+
+        let gl_objects = GlObjects::new(self.font_width, self.font_height, &self.font_data, glow)?;
 
         Ok((
             gl_objects,
@@ -757,7 +837,13 @@ impl Renderer {
         draw_data: &imgui::DrawData,
     ) -> Result<(), RendererError> {
         let backup = GlStateBackup::backup(glow);
-        let res = Self::render_window(main_window, glow, draw_data, &self.gl_objects);
+        let res = Self::render_window(
+            main_window,
+            glow,
+            draw_data,
+            &self.gl_objects,
+            draw_data.framebuffer_scale,
+        );
         backup.restore(glow);
         res
     }
@@ -779,7 +865,14 @@ impl Renderer {
                     glow.disable(glow::SCISSOR_TEST);
                     glow.clear(glow::COLOR_BUFFER_BIT);
                 }
-                Self::render_window(wnd, glow, viewport.draw_data(), gl_objects)?;
+                let framebuffer_scale = [viewport.dpi_scale, viewport.dpi_scale];
+                Self::render_window(
+                    wnd,
+                    glow,
+                    viewport.draw_data(),
+                    gl_objects,
+                    framebuffer_scale,
+                )?;
                 surface
                     .swap_buffers(&current_context)
                     .map_err(|_| RendererError::SwapBuffersFailed)?;
@@ -796,21 +889,30 @@ impl Renderer {
         glow: &glow::Context,
         draw_data: &imgui::DrawData,
         gl_objects: &GlObjects,
+        framebuffer_scale: [f32; 2],
     ) -> Result<(), RendererError> {
         unsafe {
-            let window_size = window.inner_size();
-
-            glow.viewport(0, 0, window_size.width as i32, window_size.height as i32);
+            // draw_data.framebuffer_scale is hardcoded to
+            // display_framebuffer_scale, which isn't that useful.
+            let viewport_w = draw_data.display_size[0] * framebuffer_scale[0];
+            let viewport_h = draw_data.display_size[1] * framebuffer_scale[1];
+            glow.viewport(0, 0, viewport_w as i32, viewport_h as i32);
 
             glow.enable(glow::BLEND);
-            glow.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+            glow.blend_func_separate(
+                glow::SRC_ALPHA,
+                glow::ONE_MINUS_SRC_ALPHA,
+                glow::ONE_MINUS_DST_ALPHA,
+                glow::ONE,
+            );
+            glow.blend_equation_separate(glow::FUNC_ADD, glow::FUNC_ADD);
             glow.enable(glow::SCISSOR_TEST);
 
             glow.bind_vertex_array(Some(gl_objects.vao));
             glow.bind_buffer(glow::ARRAY_BUFFER, Some(gl_objects.vbo));
             glow.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(gl_objects.ibo));
             glow.active_texture(glow::TEXTURE0);
-            glow.bind_texture(glow::TEXTURE_2D, Some(gl_objects.font_texture));
+            glow.bind_texture(glow::TEXTURE_2D, Some(gl_objects.font_atlas));
             glow.use_program(Some(gl_objects.program));
 
             let left = draw_data.display_pos[0];
@@ -862,16 +964,20 @@ impl Renderer {
 
                 for cmd in list.commands() {
                     if let imgui::DrawCmd::Elements { count, cmd_params } = cmd {
-                        let clip_x1 = (cmd_params.clip_rect[0] - draw_data.display_pos[0]) as i32;
-                        let clip_y1 = (cmd_params.clip_rect[1] - draw_data.display_pos[1]) as i32;
-                        let clip_x2 = (cmd_params.clip_rect[2] - draw_data.display_pos[0]) as i32;
-                        let clip_y2 = (cmd_params.clip_rect[3] - draw_data.display_pos[1]) as i32;
+                        let clip_rect = cmd_params.clip_rect;
+                        let clip_off = draw_data.display_pos;
+                        let clip_scale = framebuffer_scale;
+
+                        let clip_x1 = (clip_rect[0] - clip_off[0]) * clip_scale[0];
+                        let clip_y1 = (clip_rect[1] - clip_off[1]) * clip_scale[1];
+                        let clip_x2 = (clip_rect[2] - clip_off[0]) * clip_scale[0];
+                        let clip_y2 = (clip_rect[3] - clip_off[1]) * clip_scale[1];
 
                         glow.scissor(
-                            clip_x1,
-                            window_size.height as i32 - clip_y2,
-                            clip_x2 - clip_x1,
-                            clip_y2 - clip_y1,
+                            clip_x1 as i32,
+                            (viewport_h - clip_y2) as i32,
+                            (clip_x2 - clip_x1) as i32,
+                            (clip_y2 - clip_y1) as i32,
                         );
                         glow.draw_elements_base_vertex(
                             glow::TRIANGLES,

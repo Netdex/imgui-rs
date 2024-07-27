@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-imgui = { version = "0.12.0", path="../imgui", features=["docking"] }
+imgui = { version = "0.12.0", path = "../imgui", features = ["docking"] }
 
 glow = "0.13.1"
 glutin = "0.31.1"
@@ -18,3 +18,6 @@ glutin-winit = "0.4.2"
 raw-window-handle = "0.5.0"
 winit = "0.29.3"
 thiserror = "1.0.38"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58.0", features = ["Win32_Graphics_Dwm"] }
